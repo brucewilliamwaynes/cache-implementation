@@ -1297,16 +1297,13 @@ class CacheControllerTest {
 
 ```bash
 # Build the project
-mvn clean install
+gradle clean build
 
 # Run tests
-mvn test
-
-# Run with coverage report
-mvn test jacoco:report
+gradle test
 
 # Start the application
-mvn spring-boot:run
+gradle bootRun
 
 # Test API endpoints
 curl -X POST http://localhost:8080/api/v1/cache \

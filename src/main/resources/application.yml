@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+cache:
+  lru:
+    capacity: 100
+  persistence:
+    enabled: true
+    file-path: ./cache-data.json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics

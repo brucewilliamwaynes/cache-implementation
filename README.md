@@ -17,16 +17,16 @@ A high-performance, thread-safe **Least Recently Used (LRU) Cache** implementati
 ### Prerequisites
 
 - Java 17+
-- Maven 3.6+
+- Gradle 8+ installed (or use an existing Gradle installation)
 
 ### Build & Run
 
 ```bash
 # Build the project
-mvn clean install
+gradle clean build
 
 # Run the application
-mvn spring-boot:run
+gradle bootRun
 ```
 
 The application will start on `http://localhost:8080`.
