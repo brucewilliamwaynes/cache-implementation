@@ -61,6 +61,8 @@ cache-implementation/
 │   │   │           │   ├── Cache.java                    # Interface
 │   │   │           │   ├── LRUCache.java                 # Core implementation
 │   │   │           │   └── Node.java                     # Doubly linked list node
+│   │   │           ├── persistence/
+│   │   │           │   └── CachePersistenceManager.java  # Persistence handling
 │   │   │           ├── service/
 │   │   │           │   ├── CacheService.java             # Service interface
 │   │   │           │   └── LRUCacheService.java          # Service implementation
@@ -69,7 +71,8 @@ cache-implementation/
 │   │   │           ├── dto/
 │   │   │           │   ├── CacheEntryRequest.java
 │   │   │           │   ├── CacheEntryResponse.java
-│   │   │           │   └── CacheStatsResponse.java
+│   │   │           │   ├── CacheStatsResponse.java
+│   │   │           │   └── CapacityUpdateRequest.java
 │   │   │           └── exception/
 │   │   │               ├── CacheException.java
 │   │   │               └── GlobalExceptionHandler.java
@@ -81,6 +84,8 @@ cache-implementation/
 │               └── cache/
 │                   ├── core/
 │                   │   └── LRUCacheTest.java
+│                   ├── persistence/
+│                   │   └── CachePersistenceManagerTest.java
 │                   ├── service/
 │                   │   └── LRUCacheServiceTest.java
 │                   └── controller/
@@ -229,12 +234,15 @@ public class Node<K, V> {
 ```java
 package com.cache.core;
 
+import java.util.Map;
 import java.util.Optional;
 
 /**
  * Generic cache interface defining core cache operations.
+ * Supports any Object type as values.
+ * 
  * @param <K> Key type
- * @param <V> Value type
+ * @param <V> Value type (supports any Object)
  */
 public interface Cache<K, V> {
     
@@ -247,8 +255,9 @@ public interface Cache<K, V> {
     
     /**
      * Stores a key-value pair in the cache.
+     * Values can be any Object type including complex objects, collections, etc.
      * @param key The key
-     * @param value The value
+     * @param value The value (any Object type)
      */
     void put(K key, V value);
     
@@ -277,11 +286,26 @@ public interface Cache<K, V> {
     int capacity();
     
     /**
+     * Updates the cache capacity at runtime.
+     * If new capacity is smaller than current size, LRU entries will be evicted.
+     * @param newCapacity The new maximum capacity
+     * @throws IllegalArgumentException if newCapacity is not positive
+     */
+    void setCapacity(int newCapacity);
+    
+    /**
      * Checks if a key exists in the cache.
      * @param key The key to check
      * @return true if the key exists
      */
     boolean containsKey(K key);
+    
+    /**
+     * Returns all entries in the cache as a Map.
+     * Used primarily for persistence operations.
+     * @return Map of all key-value pairs in the cache
+     */
+    Map<K, V> getAllEntries();
 }
 ```
 
@@ -295,20 +319,23 @@ public interface Cache<K, V> {
 package com.cache.core;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Thread-safe LRU Cache implementation using HashMap and Doubly Linked List.
  * Provides O(1) time complexity for get and put operations.
+ * Supports runtime capacity configuration and any Object type as values.
  * 
  * @param <K> Key type
- * @param <V> Value type
+ * @param <V> Value type (supports any Object)
  */
 public class LRUCache<K, V> implements Cache<K, V> {
     
-    private final int capacity;
+    private final AtomicInteger capacity;
     private final Map<K, Node<K, V>> cache;
     private final Node<K, V> head;  // Dummy head (most recently used)
     private final Node<K, V> tail;  // Dummy tail (least recently used)
@@ -318,7 +345,7 @@ public class LRUCache<K, V> implements Cache<K, V> {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be positive");
         }
-        this.capacity = capacity;
+        this.capacity = new AtomicInteger(capacity);
         this.cache = new HashMap<>();
         this.lock = new ReentrantReadWriteLock();
         
@@ -369,7 +396,7 @@ public class LRUCache<K, V> implements Cache<K, V> {
                 addToHead(newNode);
                 
                 // Evict if over capacity
-                if (cache.size() > capacity) {
+                while (cache.size() > capacity.get()) {
                     Node<K, V> lru = removeTail();
                     cache.remove(lru.key);
                 }
@@ -418,7 +445,25 @@ public class LRUCache<K, V> implements Cache<K, V> {
     
     @Override
     public int capacity() {
-        return capacity;
+        return capacity.get();
+    }
+    
+    @Override
+    public void setCapacity(int newCapacity) {
+        if (newCapacity <= 0) {
+            throw new IllegalArgumentException("Capacity must be positive");
+        }
+        lock.writeLock().lock();
+        try {
+            this.capacity.set(newCapacity);
+            // Evict LRU entries if current size exceeds new capacity
+            while (cache.size() > newCapacity) {
+                Node<K, V> lru = removeTail();
+                cache.remove(lru.key);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
     
     @Override
@@ -426,6 +471,23 @@ public class LRUCache<K, V> implements Cache<K, V> {
         lock.readLock().lock();
         try {
             return cache.containsKey(key);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    @Override
+    public Map<K, V> getAllEntries() {
+        lock.readLock().lock();
+        try {
+            // Return entries in LRU order (most recently used first)
+            Map<K, V> entries = new LinkedHashMap<>();
+            Node<K, V> current = head.next;
+            while (current != tail) {
+                entries.put(current.key, current.value);
+                current = current.next;
+            }
+            return entries;
         } finally {
             lock.readLock().unlock();
         }
@@ -500,19 +562,52 @@ package com.cache.config;
 
 import com.cache.core.Cache;
 import com.cache.core.LRUCache;
+import com.cache.persistence.CachePersistenceManager;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 
 @Configuration
 public class CacheConfig {
     
     @Value("${cache.lru.capacity:100}")
-    private int cacheCapacity;
+    private int initialCacheCapacity;
+    
+    @Value("${cache.persistence.enabled:true}")
+    private boolean persistenceEnabled;
+    
+    @Value("${cache.persistence.file-path:./cache-data.json}")
+    private String persistenceFilePath;
+    
+    private LRUCache<String, Object> lruCacheInstance;
+    private CachePersistenceManager<String, Object> persistenceManager;
     
     @Bean
     public Cache<String, Object> lruCache() {
-        return new LRUCache<>(cacheCapacity);
+        lruCacheInstance = new LRUCache<>(initialCacheCapacity);
+        return lruCacheInstance;
+    }
+    
+    @Bean
+    public CachePersistenceManager<String, Object> cachePersistenceManager() {
+        persistenceManager = new CachePersistenceManager<>(persistenceFilePath);
+        return persistenceManager;
+    }
+    
+    @PostConstruct
+    public void loadCacheFromDisk() {
+        if (persistenceEnabled && lruCacheInstance != null && persistenceManager != null) {
+            persistenceManager.loadCache(lruCacheInstance);
+        }
+    }
+    
+    @PreDestroy
+    public void saveCacheToDisk() {
+        if (persistenceEnabled && lruCacheInstance != null && persistenceManager != null) {
+            persistenceManager.saveCache(lruCacheInstance);
+        }
     }
 }
 ```
@@ -526,6 +621,9 @@ server:
 cache:
   lru:
     capacity: 100
+  persistence:
+    enabled: true
+    file-path: ./cache-data.json
 
 management:
   endpoints:
@@ -536,7 +634,119 @@ management:
 
 ---
 
-### 5.3 Phase 6: Service Layer
+### 5.3 Phase 5.5: Persistence Manager
+
+**File:** `src/main/java/com/cache/persistence/CachePersistenceManager.java`
+
+```java
+package com.cache.persistence;
+
+import com.cache.core.Cache;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * Manages cache persistence to disk for recovery across application restarts.
+ * Uses JSON format for human-readable storage.
+ * 
+ * @param <K> Key type
+ * @param <V> Value type
+ */
+public class CachePersistenceManager<K, V> {
+    
+    private static final Logger logger = LoggerFactory.getLogger(CachePersistenceManager.class);
+    
+    private final String filePath;
+    private final ObjectMapper objectMapper;
+    
+    public CachePersistenceManager(String filePath) {
+        this.filePath = filePath;
+        this.objectMapper = new ObjectMapper();
+        this.objectMapper.enable(SerializationFeature.INDENT_OUTPUT);
+    }
+    
+    /**
+     * Saves the current cache state to disk.
+     * @param cache The cache to persist
+     */
+    public void saveCache(Cache<K, V> cache) {
+        try {
+            Map<K, V> entries = cache.getAllEntries();
+            CacheSnapshot<K, V> snapshot = new CacheSnapshot<>(
+                entries,
+                cache.capacity(),
+                System.currentTimeMillis()
+            );
+            objectMapper.writeValue(new File(filePath), snapshot);
+            logger.info("Cache persisted successfully. Entries: {}", entries.size());
+        } catch (IOException e) {
+            logger.error("Failed to persist cache to disk: {}", e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Loads cache state from disk and populates the cache.
+     * @param cache The cache to populate
+     */
+    @SuppressWarnings("unchecked")
+    public void loadCache(Cache<K, V> cache) {
+        File file = new File(filePath);
+        if (!file.exists()) {
+            logger.info("No persistence file found at {}. Starting with empty cache.", filePath);
+            return;
+        }
+        
+        try {
+            CacheSnapshot<K, V> snapshot = objectMapper.readValue(
+                file, 
+                new TypeReference<CacheSnapshot<K, V>>() {}
+            );
+            
+            // Restore capacity if it was persisted
+            if (snapshot.capacity() > 0) {
+                cache.setCapacity(snapshot.capacity());
+            }
+            
+            // Restore entries (in reverse order to maintain LRU order)
+            Map<K, V> entries = snapshot.entries();
+            if (entries != null) {
+                // Convert to list and reverse to maintain proper LRU order
+                var entryList = new java.util.ArrayList<>(entries.entrySet());
+                java.util.Collections.reverse(entryList);
+                for (var entry : entryList) {
+                    cache.put(entry.getKey(), entry.getValue());
+                }
+            }
+            
+            logger.info("Cache loaded from disk. Entries: {}, Timestamp: {}", 
+                cache.size(), snapshot.timestamp());
+        } catch (IOException e) {
+            logger.error("Failed to load cache from disk: {}", e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Snapshot record for cache serialization.
+     */
+    public record CacheSnapshot<K, V>(
+        Map<K, V> entries,
+        int capacity,
+        long timestamp
+    ) {}
+}
+```
+
+---
+
+### 5.4 Phase 6: Service Layer
 
 **File:** `src/main/java/com/cache/service/CacheService.java`
 
@@ -552,6 +762,7 @@ public interface CacheService<K, V> {
     void clear();
     int size();
     int capacity();
+    void setCapacity(int newCapacity);
     boolean containsKey(K key);
     CacheStats getStats();
 }
@@ -615,6 +826,11 @@ public class LRUCacheService implements CacheService<String, Object> {
     @Override
     public int capacity() {
         return cache.capacity();
+    }
+    
+    @Override
+    public void setCapacity(int newCapacity) {
+        cache.setCapacity(newCapacity);
     }
     
     @Override
@@ -691,6 +907,19 @@ public record CacheStatsResponse(
 ) {}
 ```
 
+**File:** `src/main/java/com/cache/dto/CapacityUpdateRequest.java`
+
+```java
+package com.cache.dto;
+
+import jakarta.validation.constraints.Min;
+
+public record CapacityUpdateRequest(
+    @Min(value = 1, message = "Capacity must be at least 1")
+    int capacity
+) {}
+```
+
 ---
 
 ### 6.2 Phase 8: REST Controller
@@ -703,11 +932,14 @@ package com.cache.controller;
 import com.cache.dto.CacheEntryRequest;
 import com.cache.dto.CacheEntryResponse;
 import com.cache.dto.CacheStatsResponse;
+import com.cache.dto.CapacityUpdateRequest;
 import com.cache.service.CacheService;
 import com.cache.service.LRUCacheService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1/cache")
@@ -760,6 +992,30 @@ public class CacheController {
     @GetMapping("/contains/{key}")
     public ResponseEntity<Boolean> containsKey(@PathVariable String key) {
         return ResponseEntity.ok(cacheService.containsKey(key));
+    }
+    
+    /**
+     * Get current cache capacity.
+     */
+    @GetMapping("/capacity")
+    public ResponseEntity<Map<String, Integer>> getCapacity() {
+        return ResponseEntity.ok(Map.of("capacity", cacheService.capacity()));
+    }
+    
+    /**
+     * Update cache capacity at runtime.
+     * If new capacity is smaller than current size, LRU entries will be evicted.
+     */
+    @PutMapping("/capacity")
+    public ResponseEntity<Map<String, Object>> setCapacity(
+            @Valid @RequestBody CapacityUpdateRequest request) {
+        int oldCapacity = cacheService.capacity();
+        cacheService.setCapacity(request.capacity());
+        return ResponseEntity.ok(Map.of(
+            "oldCapacity", oldCapacity,
+            "newCapacity", request.capacity(),
+            "currentSize", cacheService.size()
+        ));
     }
 }
 ```
@@ -1076,18 +1332,21 @@ curl http://localhost:8080/api/v1/cache/stats
    - Redis integration for distributed caching
    - Cluster support
 
-3. **Metrics & Monitoring**
-   - Micrometer integration
+3. **Metrics & Monitoring** *(Planned for Future Release)*
+   - Micrometer integration for production-grade metrics
    - Prometheus/Grafana dashboards
+   - Custom cache metrics (hit rate, eviction count, latency)
+   - Integration with Spring Boot Actuator metrics endpoint
 
 4. **Additional Eviction Policies**
    - LFU (Least Frequently Used)
    - FIFO (First In First Out)
    - Random eviction
 
-5. **Persistence**
-   - Disk-based backup
-   - Recovery on restart
+5. **Enhanced Persistence**
+   - Periodic auto-save (configurable interval)
+   - Backup rotation
+   - Compression support for large caches
 
 ---
 
@@ -1096,23 +1355,28 @@ curl http://localhost:8080/api/v1/cache/stats
 | Phase | Task | Estimated Time |
 |-------|------|----------------|
 | 1-3 | Core LRU Cache Implementation | 2-3 hours |
-| 4-6 | Spring Integration & Service Layer | 1-2 hours |
-| 7-9 | REST API & Exception Handling | 1-2 hours |
+| 4-5.5 | Spring Integration, Persistence & Service Layer | 2-3 hours |
+| 6-9 | REST API & Exception Handling | 1-2 hours |
 | 10-11 | Testing | 2-3 hours |
 | - | Documentation & Review | 1 hour |
-| **Total** | | **7-11 hours** |
+| **Total** | | **8-12 hours** |
 
 ---
 
-## Open Questions
+## Design Decisions (Resolved)
 
-1. **Serialization**: Should the cache support serializable values only, or any object type?
-2. **Metrics**: Should we integrate with Micrometer for production-grade metrics?
-3. **Configuration**: Should capacity be configurable at runtime or only at startup?
-4. **Persistence**: Is there a need for cache persistence across restarts?
+The following design decisions have been made based on project requirements:
+
+| Question | Decision | Rationale |
+|----------|----------|-----------|
+| **Value Types** | Support any Object type | Cache values can be any Object including complex objects, collections, Maps, etc. JSON serialization via Jackson handles persistence. |
+| **Metrics Integration** | Deferred to future release | Micrometer integration planned for v2.0. Current implementation includes basic hit/miss statistics via the stats endpoint. |
+| **Runtime Configuration** | Capacity is configurable at runtime | The `setCapacity()` method allows dynamic capacity changes via REST API (`PUT /api/v1/cache/capacity`). LRU eviction occurs automatically if new capacity is smaller than current size. |
+| **Persistence** | Enabled by default | Cache state is persisted to disk on application shutdown and restored on startup. Configurable via `cache.persistence.enabled` property. |
 
 ---
 
-*Document Version: 1.0*  
+*Document Version: 2.0*  
 *Created: 2026-02-11*  
+*Last Updated: 2026-02-11*  
 *Author: Implementation Planning Assistant*
